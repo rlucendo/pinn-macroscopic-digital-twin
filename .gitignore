@@ -1,0 +1,42 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Medical Data & Checkpoints (CRITICAL)
+data/
+*.nii
+*.nii.gz
+*.mha
+*.nrrd
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.h5
+*.onnx
+
+# Logs & Tracking
+logs/
+tb_logs/
+lightning_logs/
+wandb/
+mlruns/
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
