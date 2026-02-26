@@ -15,7 +15,7 @@ class GlioSimSystem(L.LightningModule):
     The orchestrator module that composes the Baseline Extractor and the PINN Simulator
     into a single end-to-end trainable system.
     """
-    def __init__(self, in_channels: int = 4, lambda_pde: float = 0.1, lr: float = 1e-4):
+    def __init__(self, in_channels: int = 1, lambda_pde: float = 0.1, lr: float = 1e-4):
         super().__init__()
         self.save_hyperparameters()
         
@@ -98,7 +98,7 @@ def main():
     )
 
     # 3. Initialize the Composed System
-    model = GlioSimSystem(in_channels=4, lambda_pde=0.1, lr=1e-4)
+    model = GlioSimSystem(in_channels=1, lambda_pde=0.1, lr=1e-4)
 
     # 4. Setup MLOps Callbacks & Logger
     wandb_logger = WandbLogger(project="GlioSim-Digital-Twin", name="PINN-End-to-End")

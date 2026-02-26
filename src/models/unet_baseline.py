@@ -15,7 +15,7 @@ class BaselineStateExtractor(nn.Module):
 
     def __init__(
         self, 
-        in_channels: int = 4, 
+        in_channels: int = 1, 
         out_features: int = 16, 
         dropout: float = 0.1
     ):
