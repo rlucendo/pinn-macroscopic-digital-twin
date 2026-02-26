@@ -14,7 +14,7 @@ __pycache__/
 *.so
 
 # Medical Data & Checkpoints (CRITICAL)
-data/
+/data/
 *.nii
 *.nii.gz
 *.mha
