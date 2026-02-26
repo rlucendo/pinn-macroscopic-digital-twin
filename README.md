@@ -27,13 +27,19 @@ Instead of letting the network guess the next frame, we force it to minimize a l
 
 $$\frac{\partial u}{\partial t} = \nabla \cdot (D \nabla u) + \rho u (1 - u)$$
 
-Where:
-* $u(\mathbf{x}, t)$ is the normalized tumor cell concentration at 3D spatial coordinate $\mathbf{x}$ and time $t$.
-* $D(\mathbf{x})$ represents the spatial diffusion tensor (modeling the tumor's invasive spread, which moves faster through white matter than gray matter).
-* $\rho(\mathbf{x})$ is the localized cellular proliferation rate.
-* The term $(1 - u)$ enforces logistic growth, representing the carrying capacity of the tissue (preventing infinite biological density).
+**Mathematical & Biological Breakdown:**
 
-In this architecture, the PINN acts as an inverse-problem solver. It does not just output a future image; it implicitly learns the patient-specific spatial distributions of $D$ and $\rho$ from the baseline MRI, creating a truly personalized predictive model.
+* **$\frac{\partial u}{\partial t}$ (Temporal Evolution):** The partial derivative of tumor concentration with respect to time. It represents the rate of change of the tumor's density at any given point.
+* **$u(\mathbf{x}, t)$ (State Variable):** The normalized tumor cell concentration at a specific 3D spatial coordinate $\mathbf{x} = (x, y, z)$ and time $t$. It is strictly bounded between $0$ (healthy tissue) and $1$ (maximum tumor density).
+* **$\nabla \cdot (D \nabla u)$ (The Diffusion/Invasion Term):** Models how tumor cells physically migrate.
+    * $\nabla u$ is the spatial gradient, indicating the direction of highest tumor concentration.
+    * $D(\mathbf{x})$ is the spatial diffusion tensor. It is patient-specific and spatially variable, capturing the biological reality that gliomas invade along white matter tracts significantly faster than through gray matter.
+    * $\nabla \cdot$ is the divergence operator, calculating the net flow of cells into adjacent voxels.
+* **$\rho u (1 - u)$ (The Reaction/Proliferation Term):** Models local cellular division.
+    * $\rho(\mathbf{x})$ is the localized cellular proliferation rate.
+    * $(1 - u)$ enforces logistic growth. It represents the "carrying capacity" of the brain tissue. As tumor concentration $u$ approaches $1$, this term approaches $0$, halting infinite biological density and effectively simulating the emergence of a necrotic core (dead tissue) when resources are exhausted.
+
+In this architecture, the PINN acts as an inverse-problem solver. It does not merely output a future image; it implicitly learns the patient-specific spatial distributions of $D$ and $\rho$ from the baseline MRI, creating a truly personalized predictive model.
 
 ---
 
