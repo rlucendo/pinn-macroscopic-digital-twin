@@ -76,24 +76,35 @@ class InferencePipeline:
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
                 try:
+                    # 1. Unpack necessary tensors
                     image_t0 = batch["image_t0"].to(self.device)
+                    mask_t0 = batch["mask_t0"].to(self.device) # Mandatory starting point for Euler solver
                     mask_tn = batch["mask_tn"].to(self.device)
                     delta_t = batch["time_delta"].to(self.device)
                     
-                    # El DataLoader guarda la matriz espacial si usamos MONAI
-                    # Extraemos el Affine original si está disponible (fallback a eye(4))
+                    # 2. Extract spatial Affine matrix for accurate NIfTI export
                     if "image_t0_meta_dict" in batch and "affine" in batch["image_t0_meta_dict"]:
                         original_affine = batch["image_t0_meta_dict"]["affine"][0].cpu().numpy()
                     else:
                         original_affine = np.eye(4)
                     
-                    # 1. Forward simulation to time T_n
-                    u_pred_tn, raw_D, raw_rho = self.model(image_t0, delta_t)
+                    # 3. Step One: Neural Extraction of Static Parameters
+                    raw_D, raw_rho = self.model(image_t0)
 
-                    # 2. Binarize prediction (Crucial to remove the "Gray Ghost")
+                    # 4. Step Two: Biological Scaling
+                    d_map = 0.001 + torch.sigmoid(raw_D) * (0.020 - 0.001)
+                    rho_map = 0.012 + torch.sigmoid(raw_rho) * (0.034 - 0.012)
+
+                    # 5. Step Three: Hard Physics Forward Simulation
+                    u_pred_tn = self.model.simulator(
+                        u_t0=mask_t0, 
+                        D_map=d_map, 
+                        rho_map=rho_map, 
+                        delta_t=delta_t
+                    )
+
+                    # 6. Evaluation Metrics (Dice Score)
                     u_pred_binary = (u_pred_tn > 0.5).float()
-                    
-                    # 3. Dice Computation
                     intersection = torch.sum(u_pred_binary * mask_tn)
                     union = torch.sum(u_pred_binary) + torch.sum(mask_tn)
                     dice_score = (2.0 * intersection + 1e-8) / (union + 1e-8)
@@ -101,11 +112,7 @@ class InferencePipeline:
                     total_dice += dice_score.item()
                     processed_count += 1
 
-                    # 4. Map raw outputs to biological scales
-                    d_map = 0.001 + torch.sigmoid(raw_D) * (0.020 - 0.001)
-                    rho_map = 0.012 + torch.sigmoid(raw_rho) * (0.034 - 0.012)
-
-                    # 5. Export NIfTIs using the BINARY mask and the REAL Affine matrix
+                    # 7. NIfTI Artifact Export
                     subject_prefix = f"subject_{batch_idx:03d}"
                     self._export_nifti(u_pred_binary, f"{subject_prefix}_pred_density_tn.nii.gz", original_affine)
                     self._export_nifti(d_map, f"{subject_prefix}_diffusion_map.nii.gz", original_affine)
