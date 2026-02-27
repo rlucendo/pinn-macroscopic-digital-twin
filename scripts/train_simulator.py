@@ -1,136 +1,155 @@
+import os
 import argparse
+import logging
 import torch
-import lightning as L
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.loggers import WandbLogger
 
-# Import our custom domain modules
+# Domain imports
 from src.data.longitudinal_dm import LongitudinalDataModule
 from src.models.unet_baseline import BaselineStateExtractor
 from src.models.pinn_simulator import PINNSimulator
 
+# Configure structured professional logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("DigitalTwin_TheoreticalTrainer")
 
-class GlioSimSystem(L.LightningModule):
+
+class TheoreticalGlioSimSystem(pl.LightningModule):
     """
-    The orchestrator module that composes the Baseline Extractor and the PINN Simulator
-    into a single end-to-end trainable system.
+    LightningModule orchestrating the Physics-Informed Neural Network.
+    Optimizes the neural weights to solve the Fisher-Kolmogorov PDE 
+    without relying on future ground-truth data.
     """
-    def __init__(self, in_channels: int = 1, lambda_pde: float = 0.1, lr: float = 1e-4):
+    def __init__(self, learning_rate: float = 1e-4):
         super().__init__()
         self.save_hyperparameters()
         
-        # 1. Instantiate the modules
-        # The U-Net extracts 16 latent channels from the 4 MRI modalities
-        self.extractor = BaselineStateExtractor(in_channels=in_channels, out_features=16)
+        # Neural architecture for feature extraction
+        self.extractor = BaselineStateExtractor(in_channels=1, spatial_dims=3)
         
-        # The PINN Simulator takes the 16 channels + 1 time channel
-        self.simulator = PINNSimulator(
-            in_channels=16, 
-            lambda_pde=lambda_pde, 
-            learning_rate=lr
-        )
+        # Theoretical PDE Solver
+        self.simulator = PINNSimulator()
 
-    def forward(self, x_t0: torch.Tensor, t: torch.Tensor):
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
         """
-        End-to-end forward pass: Image T0 + time -> Future State Tn
+        Executes the neural forward pass.
+        Returns the continuous tumor density (u), and the raw biological tensors (D, rho).
         """
-        # Extract baseline topological state
-        spatial_features = self.extractor(x_t0)
-        
-        # Predict future state and physical parameters
-        u, dudt, D, rho = self.simulator(spatial_features, t)
-        return u, dudt, D, rho
+        # The extractor must handle broadcasting or concatenating the scalar 't'
+        # into the spatial volume to compute the state at time 't'.
+        u_pred, raw_D, raw_rho = self.extractor(x, t)
+        return u_pred, raw_D, raw_rho
 
     def training_step(self, batch, batch_idx):
         """
-        Defines the end-to-end training loop using our PDE Loss.
+        Executes the physics-constrained training loop.
         """
-        # Batch unpacking based on our LongitudinalDataModule transforms
-        # MONAI dictionaries output the keys we defined in the ETL pipeline
-        x_t0 = batch["image_t0"]
-        target_tn = batch["mask_tn"]
-        t = batch["time_delta"]
+        image_t0 = batch["image_t0"]
+        mask_t0 = batch["mask_t0"]
+        batch_size = image_t0.shape[0]
+
+        # 1. Evaluate Initial Condition (t = 0)
+        # Time tensor must match the batch dimension, shaped [B, 1]
+        t0 = torch.zeros((batch_size, 1), device=self.device, dtype=torch.float32)
+        u_pred_t0, raw_D, raw_rho = self(image_t0, t0)
+
+        # 2. Evaluate Physics at random continuous time
+        # Generate t ~ U(1.0, 300.0) days
+        t_rand = torch.empty((batch_size, 1), device=self.device, dtype=torch.float32).uniform_(1.0, 300.0)
+        t_rand.requires_grad = True
         
-        # Forward pass through the composed system
-        pred_u, pred_dudt, pred_D, pred_rho = self(x_t0, t)
-        
-        # Calculate losses (delegating to the simulator's loss functions)
-        loss_data = self.simulator.data_loss_fn(pred_u, target_tn)
-        loss_physics = self.simulator.physics_loss_fn(pred_u, pred_dudt, pred_D, pred_rho)
-        
-        # Total Loss formulation: L_Total = L_Data + lambda * L_PDE
-        loss_total = loss_data + (self.hparams.lambda_pde * loss_physics)
-        
-        # Logging for Weights & Biases
-        self.log("train/loss_data", loss_data, on_step=True, on_epoch=True)
-        self.log("train/loss_physics", loss_physics, on_step=True, on_epoch=True)
-        self.log("train/loss_total", loss_total, on_step=True, on_epoch=True, prog_bar=True)
-        
-        return loss_total
+        u_pred_t, _, _ = self(image_t0, t_rand)
+
+        # 3. Compute Theoretical Loss via PINN Simulator
+        total_loss, loss_ic, loss_physics = self.simulator.calculate_loss(
+            u_pred_t=u_pred_t,
+            u_pred_t0=u_pred_t0,
+            target_t0=mask_t0,
+            t=t_rand,
+            raw_D=raw_D,
+            raw_rho=raw_rho
+        )
+
+        # 4. Telemetry and Logging
+        self.log("train/loss_total", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/loss_ic", loss_ic, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/loss_physics", loss_physics, on_step=False, on_epoch=True, prog_bar=True)
+
+        return total_loss
 
     def configure_optimizers(self):
-        # We optimize both the extractor and the simulator simultaneously (End-to-End)
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=10
+        """
+        Configures the AdamW optimizer with weight decay for regularization.
+        """
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.hparams.learning_rate, 
+            weight_decay=1e-5
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "train/loss_total"
-            }
-        }
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=150, 
+            eta_min=1e-6
+        )
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
 def main():
-    # 1. Parse arguments (mocked for simplicity, ideally loaded from config_pinn.yaml)
-    parser = argparse.ArgumentParser(description="Train GlioSim PINN")
-    parser.add_argument("--data_dir", type=str, default="data/", help="Path to NIfTI data")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size (1 for 3D)")
-    parser.add_argument("--epochs", type=int, default=100, help="Max training epochs")
+    parser = argparse.ArgumentParser(description="Train the Theoretical Digital Twin PINN")
+    parser.add_argument("--data_dir", type=str, default="data", help="Directory containing dataset_registry.csv")
+    parser.add_argument("--epochs", type=int, default=150, help="Maximum training epochs")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size (1 is recommended for 3D volumes on 40GB VRAM)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     args = parser.parse_args()
 
-    # 2. Initialize DataModule
-    datamodule = LongitudinalDataModule(
-        data_dir=args.data_dir, 
-        batch_size=args.batch_size
+    logger.info("Initializing Theoretical GlioSim Training Pipeline...")
+
+    # Initialize Modules
+    datamodule = LongitudinalDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
+    model = TheoreticalGlioSimSystem(learning_rate=args.lr)
+
+    # Callbacks for MLOps tracking
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="gliosim-theoretical-{epoch:03d}-{train/loss_total:.4f}",
+        monitor="train/loss_total",
+        save_top_k=3,
+        mode="min"
     )
-
-    # 3. Initialize the Composed System
-    model = GlioSimSystem(in_channels=1, lambda_pde=0.1, lr=1e-4)
-
-    # 4. Setup MLOps Callbacks & Logger
-    wandb_logger = WandbLogger(project="GlioSim-Digital-Twin", name="PINN-End-to-End")
     
-    callbacks = [
-        ModelCheckpoint(
-            dirpath="checkpoints/",
-            filename="gliosim-{epoch:02d}-{train/loss_total:.4f}",
-            monitor="train/loss_total",
-            mode="min",
-            save_top_k=3,
-        ),
-        EarlyStopping(monitor="train/loss_total", patience=20, mode="min"),
-        LearningRateMonitor(logging_interval="epoch"),
-    ]
-
-    # 5. Initialize Lightning Trainer
-    # Hardware resilience: mixed precision for memory efficiency
-    trainer = L.Trainer(
-        max_epochs=args.epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        precision="16-mixed" if torch.cuda.is_available() else "32-true",
-        logger=wandb_logger,
-        callbacks=callbacks,
-        log_every_n_steps=5,
+    early_stop_callback = EarlyStopping(
+        monitor="train/loss_physics",
+        patience=30,
+        mode="min",
+        verbose=True
     )
 
-    # 6. Start Training!
-    print("Starting GlioSim Digital Twin Training Pipeline...")
+    # Integration with Weights & Biases
+    wandb_logger = WandbLogger(project="GlioSim-Theoretical-Twin", log_model="all")
+
+    # Trainer configuration for NVIDIA A100
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator="gpu",
+        devices=1,
+        precision="16-mixed",
+        logger=wandb_logger,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        log_every_n_steps=5,
+        enable_progress_bar=True
+    )
+
+    logger.info("Commencing theoretical PDE optimization loop.")
     trainer.fit(model, datamodule=datamodule)
 
 
 if __name__ == "__main__":
+    # Force PyTorch to use Tensor Cores for matrix multiplication
+    torch.set_float32_matmul_precision('high')
     main()
