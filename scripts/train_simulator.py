@@ -2,11 +2,11 @@ import os
 import argparse
 import logging
 import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import WandbLogger
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+from lightning.pytorch.loggers import WandbLogger
 
-# Domain imports
+# Domain imports (These must be present for the script to recognize our classes)
 from src.data.longitudinal_dm import LongitudinalDataModule
 from src.models.unet_baseline import BaselineStateExtractor
 from src.models.pinn_simulator import PINNSimulator
@@ -31,7 +31,7 @@ class TheoreticalGlioSimSystem(pl.LightningModule):
         self.save_hyperparameters()
         
         # Neural architecture for feature extraction
-        self.extractor = BaselineStateExtractor(in_channels=1, spatial_dims=3)
+        self.extractor = BaselineStateExtractor(in_channels=1)
         
         # Theoretical PDE Solver
         self.simulator = PINNSimulator()
@@ -47,26 +47,21 @@ class TheoreticalGlioSimSystem(pl.LightningModule):
         return u_pred, raw_D, raw_rho
 
     def training_step(self, batch, batch_idx):
-        """
-        Executes the physics-constrained training loop.
-        """
         image_t0 = batch["image_t0"]
         mask_t0 = batch["mask_t0"]
         batch_size = image_t0.shape[0]
 
-        # 1. Evaluate Initial Condition (t = 0)
-        # Time tensor must match the batch dimension, shaped [B, 1]
-        t0 = torch.zeros((batch_size, 1), device=self.device, dtype=torch.float32)
+        # 1. Initial Condition (t=0)
+        t0 = torch.zeros((batch_size, 1), device=self.device)
         u_pred_t0, raw_D, raw_rho = self(image_t0, t0)
 
-        # 2. Evaluate Physics at random continuous time
-        # Generate t ~ U(1.0, 300.0) days
-        t_rand = torch.empty((batch_size, 1), device=self.device, dtype=torch.float32).uniform_(1.0, 300.0)
-        t_rand.requires_grad = True
-        
+        # 2. Physics Condition (t=random)
+        # We sample a random time for each batch to enforce the PDE across the timeline
+        t_rand = torch.empty((batch_size, 1), device=self.device).uniform_(1.0, 100.0)
+        t_rand.requires_grad = True 
         u_pred_t, _, _ = self(image_t0, t_rand)
 
-        # 3. Compute Theoretical Loss via PINN Simulator
+        # 3. Comprehensive Loss Calculation
         total_loss, loss_ic, loss_physics = self.simulator.calculate_loss(
             u_pred_t=u_pred_t,
             u_pred_t0=u_pred_t0,
@@ -76,10 +71,11 @@ class TheoreticalGlioSimSystem(pl.LightningModule):
             raw_rho=raw_rho
         )
 
-        # 4. Telemetry and Logging
-        self.log("train/loss_total", total_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/loss_ic", loss_ic, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/loss_physics", loss_physics, on_step=False, on_epoch=True, prog_bar=True)
+        # 4. LOGGING (This satisfies EarlyStopping and ModelCheckpoint)
+        # sync_dist=True is good practice for multi-GPU, though here we are on 1x A100
+        self.log("train/loss_total", total_loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train/loss_ic", loss_ic, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train/loss_physics", loss_physics, prog_bar=True, on_step=False, on_epoch=True)
 
         return total_loss
 
@@ -133,19 +129,23 @@ def main():
     # Integration with Weights & Biases
     wandb_logger = WandbLogger(project="GlioSim-Theoretical-Twin", log_model="all")
 
-    # Trainer configuration for NVIDIA A100
+    # 1. Force TF32 for matrix multiplications (A100 specific)
+    torch.set_float32_matmul_precision('high')
+
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="gpu",
         devices=1,
-        precision="16-mixed",
+        # Use bf16-mixed: It has the dynamic range of FP32 but the speed of FP16. 
+        # Only available on A100/H100.
+        precision="bf16-mixed", 
+        gradient_clip_val=0.5,
+        benchmark=True, # JIT kernel auto-tuner
         logger=wandb_logger,
-        callbacks=[checkpoint_callback, early_stop_callback],
-        log_every_n_steps=5,
-        enable_progress_bar=True
+        callbacks=[checkpoint_callback, early_stop_callback]
     )
 
-    logger.info("Commencing theoretical PDE optimization loop.")
+    logger.info("Theoretical engine ignition. Utilizing A100 TF32 Tensor Cores.")
     trainer.fit(model, datamodule=datamodule)
 
 
