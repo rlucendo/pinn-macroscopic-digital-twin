@@ -80,11 +80,20 @@ class InferencePipeline:
                     mask_tn = batch["mask_tn"].to(self.device)
                     delta_t = batch["time_delta"].to(self.device)
                     
-                    # Forward simulation to time T_n
+                    # El DataLoader guarda la matriz espacial si usamos MONAI
+                    # Extraemos el Affine original si está disponible (fallback a eye(4))
+                    if "image_t0_meta_dict" in batch and "affine" in batch["image_t0_meta_dict"]:
+                        original_affine = batch["image_t0_meta_dict"]["affine"][0].cpu().numpy()
+                    else:
+                        original_affine = np.eye(4)
+                    
+                    # 1. Forward simulation to time T_n
                     u_pred_tn, raw_D, raw_rho = self.model(image_t0, delta_t)
 
-                    # Binarize prediction for Dice computation
+                    # 2. Binarize prediction (Crucial to remove the "Gray Ghost")
                     u_pred_binary = (u_pred_tn > 0.5).float()
+                    
+                    # 3. Dice Computation
                     intersection = torch.sum(u_pred_binary * mask_tn)
                     union = torch.sum(u_pred_binary) + torch.sum(mask_tn)
                     dice_score = (2.0 * intersection + 1e-8) / (union + 1e-8)
@@ -92,15 +101,15 @@ class InferencePipeline:
                     total_dice += dice_score.item()
                     processed_count += 1
 
-                    # Map raw outputs to biological scales
+                    # 4. Map raw outputs to biological scales
                     d_map = 0.001 + torch.sigmoid(raw_D) * (0.020 - 0.001)
                     rho_map = 0.012 + torch.sigmoid(raw_rho) * (0.034 - 0.012)
 
-                    # Export predictions and parameter maps
+                    # 5. Export NIfTIs using the BINARY mask and the REAL Affine matrix
                     subject_prefix = f"subject_{batch_idx:03d}"
-                    self._export_nifti(u_pred_tn, f"{subject_prefix}_pred_density_tn.nii.gz")
-                    self._export_nifti(d_map, f"{subject_prefix}_diffusion_map.nii.gz")
-                    self._export_nifti(rho_map, f"{subject_prefix}_proliferation_map.nii.gz")
+                    self._export_nifti(u_pred_binary, f"{subject_prefix}_pred_density_tn.nii.gz", original_affine)
+                    self._export_nifti(d_map, f"{subject_prefix}_diffusion_map.nii.gz", original_affine)
+                    self._export_nifti(rho_map, f"{subject_prefix}_proliferation_map.nii.gz", original_affine)
 
                     logger.info(f"Processed {subject_prefix} | Dice Score: {dice_score.item():.4f}")
 

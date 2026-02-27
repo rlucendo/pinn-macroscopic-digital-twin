@@ -1,15 +1,21 @@
 import os
 import argparse
 import logging
-import torch
 import lightning.pytorch as pl
+import torch
+import torch.nn.functional as F
+
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
+from src.models.differentiable_solver import DifferentiablePDESolver
+from src.models.unet_baseline import BaselineStateExtractor
 
 # Domain imports (These must be present for the script to recognize our classes)
 from src.data.longitudinal_dm import LongitudinalDataModule
 from src.models.unet_baseline import BaselineStateExtractor
 from src.models.pinn_simulator import PINNSimulator
+
+from src.models.differentiable_solver import DifferentiablePDESolver
 
 # Configure structured professional logging
 logging.basicConfig(
@@ -22,78 +28,76 @@ logger = logging.getLogger("DigitalTwin_TheoreticalTrainer")
 
 class TheoreticalGlioSimSystem(pl.LightningModule):
     """
-    LightningModule orchestrating the Physics-Informed Neural Network.
-    Optimizes the neural weights to solve the Fisher-Kolmogorov PDE 
-    without relying on future ground-truth data.
+    Hard-Physics Digital Twin Orchestrator.
+    Binds the static feature extractor (UNet) with the dynamic PDE Solver (Euler Integration).
     """
-    def __init__(self, learning_rate: float = 1e-4):
+    def __init__(self, lr: float = 1e-4):
         super().__init__()
         self.save_hyperparameters()
         
-        # Neural architecture for feature extraction
-        self.extractor = BaselineStateExtractor(in_channels=1)
+        # 1. Neural Network: Extracts D and rho from static T0 MRI
+        self.extractor = BaselineStateExtractor(in_channels=1, out_channels=2)
         
-        # Theoretical PDE Solver
-        self.simulator = PINNSimulator()
+        # 2. Hard Physics Engine: Explicitly solves the PDE over time
+        self.simulator = DifferentiablePDESolver(dt=1.0)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor):
-        """
-        Executes the neural forward pass.
-        Returns the continuous tumor density (u), and the raw biological tensors (D, rho).
-        """
-        # The extractor must handle broadcasting or concatenating the scalar 't'
-        # into the spatial volume to compute the state at time 't'.
-        u_pred, raw_D, raw_rho = self.extractor(x, t)
-        return u_pred, raw_D, raw_rho
+    def forward(self, x: torch.Tensor):
+        """Standard forward pass purely for parameter extraction."""
+        return self.extractor(x)
 
     def training_step(self, batch, batch_idx):
         image_t0 = batch["image_t0"]
         mask_t0 = batch["mask_t0"]
-        batch_size = image_t0.shape[0]
+        mask_tn = batch["mask_tn"]
+        delta_t = batch["time_delta"]
 
-        # 1. Initial Condition (t=0)
-        t0 = torch.zeros((batch_size, 1), device=self.device)
-        u_pred_t0, raw_D, raw_rho = self(image_t0, t0)
+        # 1. Neural Network extraction
+        raw_D, raw_rho = self(image_t0) 
 
-        # 2. Physics Condition (t=random)
-        # We sample a random time for each batch to enforce the PDE across the timeline
-        t_rand = torch.empty((batch_size, 1), device=self.device).uniform_(1.0, 100.0)
-        t_rand.requires_grad = True 
-        u_pred_t, _, _ = self(image_t0, t_rand)
+        # 2. Scale to Swanson's biological ranges
+        D_map = 0.001 + torch.sigmoid(raw_D) * (0.020 - 0.001)
+        rho_map = 0.012 + torch.sigmoid(raw_rho) * (0.034 - 0.012)
 
-        # 3. Comprehensive Loss Calculation
-        total_loss, loss_ic, loss_physics = self.simulator.calculate_loss(
-            u_pred_t=u_pred_t,
-            u_pred_t0=u_pred_t0,
-            target_t0=mask_t0,
-            t=t_rand,
-            raw_D=raw_D,
-            raw_rho=raw_rho
-        )
+        # 3. Hard Physics Simulation (Forward Euler)
+        # Guarantees mathematical compliance while simulating future growth
+        u_pred_tn = self.simulator(u_t0=mask_t0, D_map=D_map, rho_map=rho_map, delta_t=delta_t)
 
-        # 4. LOGGING (This satisfies EarlyStopping and ModelCheckpoint)
-        # sync_dist=True is good practice for multi-GPU, though here we are on 1x A100
-        self.log("train/loss_total", total_loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("train/loss_ic", loss_ic, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("train/loss_physics", loss_physics, prog_bar=True, on_step=False, on_epoch=True)
+        # 4. Pure Data Assimilation Loss (Target Anchor)
+        loss_total = F.mse_loss(u_pred_tn, mask_tn)
 
-        return total_loss
+        self.log("train/loss_total", loss_total, prog_bar=True, on_step=False, on_epoch=True)
+        return loss_total
+
+    def validation_step(self, batch, batch_idx):
+        image_t0 = batch["image_t0"]
+        mask_t0 = batch["mask_t0"]
+        mask_tn = batch["mask_tn"]
+        delta_t = batch["time_delta"]
+
+        # 1. Extract & Scale
+        raw_D, raw_rho = self(image_t0)
+        D_map = 0.001 + torch.sigmoid(raw_D) * (0.020 - 0.001)
+        rho_map = 0.012 + torch.sigmoid(raw_rho) * (0.034 - 0.012)
+
+        # 2. Simulate future
+        u_pred_tn = self.simulator(u_t0=mask_t0, D_map=D_map, rho_map=rho_map, delta_t=delta_t)
+
+        # 3. Validation Metrics
+        val_loss = F.mse_loss(u_pred_tn, mask_tn)
+
+        # Binary Dice Score Calculation
+        u_pred_binary = (u_pred_tn > 0.5).float()
+        intersection = torch.sum(u_pred_binary * mask_tn)
+        union = torch.sum(u_pred_binary) + torch.sum(mask_tn)
+        dice_score = (2.0 * intersection + 1e-8) / (union + 1e-8)
+
+        self.log("val/loss_total", val_loss, sync_dist=True, prog_bar=True)
+        self.log("val/dice_tn", dice_score, sync_dist=True, prog_bar=True)
+
+        return {"val_loss": val_loss, "val_dice": dice_score}
 
     def configure_optimizers(self):
-        """
-        Configures the AdamW optimizer with weight decay for regularization.
-        """
-        optimizer = torch.optim.AdamW(
-            self.parameters(), 
-            lr=self.hparams.learning_rate, 
-            weight_decay=1e-5
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=150, 
-            eta_min=1e-6
-        )
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
 
 def main():
@@ -108,21 +112,21 @@ def main():
 
     # Initialize Modules
     datamodule = LongitudinalDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
-    model = TheoreticalGlioSimSystem(learning_rate=args.lr)
+    model = TheoreticalGlioSimSystem(lr=args.lr)
 
     # Callbacks for MLOps tracking
     checkpoint_callback = ModelCheckpoint(
-        dirpath="checkpoints",
-        filename="gliosim-theoretical-{epoch:03d}-{train/loss_total:.4f}",
-        monitor="train/loss_total",
+        dirpath="checkpoints",  # Bypass directo: string hardcodeado
+        filename="gliosim-theory-{epoch:02d}-{val_dice_tn:.3f}",
+        monitor="val/dice_tn",
+        mode="max",
         save_top_k=3,
-        mode="min"
     )
     
     early_stop_callback = EarlyStopping(
-        monitor="train/loss_physics",
+        monitor="val/dice_tn",
         patience=30,
-        mode="min",
+        mode="max",
         verbose=True
     )
 
@@ -150,6 +154,13 @@ def main():
 
 
 if __name__ == "__main__":
-    # Force PyTorch to use Tensor Cores for matrix multiplication
-    torch.set_float32_matmul_precision('high')
+    import argparse
+    parser = argparse.ArgumentParser(description="Train the Differentiable PDE Solver Digital Twin.")
+    parser.add_argument("--data_dir", type=str, default="data", help="Path to data directory.")
+    parser.add_argument("--epochs", type=int, default=200, help="Maximum number of epochs.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints.")
+    
+    args = parser.parse_args()
     main()
