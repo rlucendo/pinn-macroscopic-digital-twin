@@ -56,24 +56,24 @@ def build_cloud_payload(csv_path: str, export_dir: str) -> None:
             missing_files.append(patient_id)
             continue
 
-        # 3. Define target relative paths maintaining logical separation
-        # Flattening the directory tree slightly to optimize Colab filesystem operations
+        # 3. Define target relative paths
         t0_visit_id = f"{patient_id}_11"
         
+        # Estructura destino clara y plana para Colab
         img_t0_dst = target_root / "images_structural" / t0_visit_id / img_t0_src.name
-        mask_t0_dst = target_root / "pseudo_labels" / mask_t0_src.name
-        mask_tn_dst = target_root / "pseudo_labels" / mask_tn_src.name
+        mask_t0_dst = target_root / "masks_t0" / mask_t0_src.name
+        mask_tn_dst = target_root / "masks_tn" / mask_tn_src.name
 
-        # 4. Create topological structure and execute file transfer
-        for dst_path in [img_t0_dst, mask_t0_dst, mask_tn_dst]:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
+        # 4. Crear carpetas y copiar
+        img_t0_dst.parent.mkdir(parents=True, exist_ok=True)
+        mask_t0_dst.parent.mkdir(parents=True, exist_ok=True)
+        mask_tn_dst.parent.mkdir(parents=True, exist_ok=True)
             
         shutil.copy2(img_t0_src, img_t0_dst)
         shutil.copy2(mask_t0_src, mask_t0_dst)
         shutil.copy2(mask_tn_src, mask_tn_dst)
         
-        # 5. Update registry paths to be strictly relative to the target_root
-        # This guarantees environment-agnostic execution (Local vs Cloud)
+        # 5. Actualizar rutas en el CSV
         df.at[index, 'image_t0_path'] = str(img_t0_dst.relative_to(target_root))
         df.at[index, 'mask_t0_path'] = str(mask_t0_dst.relative_to(target_root))
         df.at[index, 'mask_tn_path'] = str(mask_tn_dst.relative_to(target_root))
