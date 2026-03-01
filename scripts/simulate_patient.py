@@ -6,15 +6,10 @@ import numpy as np
 from pathlib import Path
 from monai.transforms import Resize
 
-# Domain imports
-from src.models.differentiable_solver import DifferentiableEulerSolver
-from src.physics.fisher_kolmogorov import FisherKolmogorovPDE
-from src.models.unet_baseline import BaselineStateExtractor
-from src.models.pinn_simulator import MacroscopicDigitalTwin
-# Assuming the training module is in train_simulator.py
-from scripts.train_simulator import HardPhysicsGlioSimSystem
+# Core architecture imports
+from scripts.train_simulator import SelfSupervisedGlioSim
 
-# Configure structured logging
+# Configure professional structured logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -24,104 +19,147 @@ logger = logging.getLogger("DigitalTwin_Inference")
 
 def _discretize_to_clinical_classes(u_pred: np.ndarray) -> np.ndarray:
     """
-    Maps continuous tumor density to Slicer3D compatible discrete segments.
-    Values are theoretical placeholders and should be calibrated clinically.
-    - Class 0: Background
-    - Class 1: Edema / Infiltration (0.05 < u <= 0.20)
-    - Class 2: Enhancing Core (0.20 < u <= 0.80)
-    - Class 3: Necrotic Core (u > 0.80)
+    Translates continuous tumor density into BraTS/UPENN discrete segments.
+    1: Necrosis, 2: Edema/Infiltrating, 4: Enhancing Core.
     """
     segmentation = np.zeros_like(u_pred, dtype=np.uint8)
     
-    segmentation[(u_pred > 0.05) & (u_pred <= 0.20)] = 1
-    segmentation[(u_pred > 0.20) & (u_pred <= 0.80)] = 2
-    segmentation[u_pred > 0.80] = 3
+    # Edema (Infiltrating region, low to moderate density)
+    segmentation[(u_pred > 0.05) & (u_pred <= 0.20)] = 2
+    
+    # Enhancing Core (High density)
+    segmentation[(u_pred > 0.20) & (u_pred <= 0.80)] = 4
+    
+    # Necrotic Core (Hypoxic inner region, max density)
+    segmentation[u_pred > 0.80] = 1
     
     return segmentation
 
 def run_simulation(
     checkpoint_path: str,
-    image_t0_path: str,
-    mask_t0_path: str,
+    data_dir: str,
+    patient_id: str,
     output_dir: str,
     target_days: float
 ):
-    """Executes the forward simulation for a single patient."""
+    """Executes the forward simulation using the 4-channel Amortized model."""
     logger.info("Initializing inference pipeline...", extra={"checkpoint": checkpoint_path})
     
-    # 1. Load Model from Checkpoint
+    # --- PYTORCH 2.6+ SECURITY PATCH ---
+    import monai
     try:
-        model = HardPhysicsGlioSimSystem.load_from_checkpoint(checkpoint_path)
+        torch.serialization.add_safe_globals([monai.utils.enums.TraceKeys])
+    except AttributeError:
+        pass # Fallback for older PyTorch versions
+    # -----------------------------------
+    
+    try:
+        # Pytorch Lightning will now allow the MONAI TraceKeys to pass
+        model = SelfSupervisedGlioSim.load_from_checkpoint(checkpoint_path)
         model.eval()
-        model.to("cuda" if torch.cuda.is_available() else "cpu")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
     except Exception as e:
         logger.error(f"Failed to load checkpoint: {e}", exc_info=True)
         raise
 
-    # 2. Load and Preprocess Data (Mirroring DataModule logic)
-    img_nifti = nib.load(image_t0_path)
-    mask_nifti = nib.load(mask_t0_path)
+    # 1. Locate and Load Multimodal Data
+    images_dir = Path(data_dir) / "images"
+    masks_dir = Path(data_dir) / "masks"
     
-    original_affine = img_nifti.affine
-    original_shape = img_nifti.shape
+    modality_suffixes = ["FLAIR", "T1", "T1GD", "T2"]
+    modalities = []
+    original_affine = None
+    original_shape = None
     
-    img_data = img_nifti.get_fdata()
-    mask_data = mask_nifti.get_fdata()
+    logger.info(f"Loading 4-channel structural MRI for patient {patient_id}...")
     
-    # Z-Score Normalization
-    mask_bg = img_data > 0
-    if mask_bg.sum() > 0:
-        img_data = (img_data - img_data[mask_bg].mean()) / (img_data[mask_bg].std() + 1e-8)
-        img_data[~mask_bg] = 0.0
+    for mod in modality_suffixes:
+        # Glob search to handle slight naming variations
+        matches = list(images_dir.glob(f"*{patient_id}*{mod}*"))
+        if not matches:
+            logger.error(f"Missing {mod} modality for patient {patient_id}")
+            raise FileNotFoundError(f"Missing modality: {mod}")
+            
+        nifti = nib.load(matches[0])
         
-    img_tensor = torch.from_numpy(img_data).float().unsqueeze(0).unsqueeze(0) # [1, 1, D, H, W]
-    mask_tensor = torch.from_numpy(mask_data).float().unsqueeze(0).unsqueeze(0)
-    
-    # Spatial alignment to UNet topology
-    resizer = Resize(spatial_size=(96, 96, 96), mode="trilinear")
-    mask_resizer = Resize(spatial_size=(96, 96, 96), mode="nearest")
-    
-    img_resized = resizer(img_tensor).to(model.device)
-    mask_resized = mask_resizer(mask_tensor).to(model.device)
-    delta_t = torch.tensor([target_days], dtype=torch.float32).to(model.device)
+        if original_affine is None:
+            original_affine = nifti.affine
+            original_shape = nifti.shape[:3]
+            
+        img = nifti.get_fdata()
+        
+        # Z-Score Normalization
+        mask_bg = img > 0
+        if mask_bg.sum() > 0:
+            img = (img - img[mask_bg].mean()) / (img[mask_bg].std() + 1e-8)
+            img[~mask_bg] = 0.0
+            
+        modalities.append(torch.from_numpy(img).float().unsqueeze(0))
 
-    logger.info("Starting temporal integration.", extra={"target_days": target_days})
+    # Shape: [4, D, H, W] -> Eliminamos el .unsqueeze(0) extra aquí
+    multi_channel_img = torch.cat(modalities, dim=0)
+    
+    # 2. Locate and Load T0 Mask (The starting point for the future simulation)
+    mask_matches = list(masks_dir.glob(f"*{patient_id}*"))
+    if not mask_matches:
+        raise FileNotFoundError(f"Missing T0 mask for patient {patient_id}")
+        
+    mask_nifti = nib.load(mask_matches[0])
+    raw_mask = mask_nifti.get_fdata()
+    
+    # Translate to density
+    density_map = np.zeros_like(raw_mask, dtype=np.float32)
+    density_map[(raw_mask == 1) | (raw_mask == 4) | (raw_mask == 3)] = 1.0
+    density_map[raw_mask == 2] = 0.5
+    
+    # Shape: [1, D, H, W] -> Eliminamos un .unsqueeze(0) para que MONAI lo entienda
+    mask_tensor = torch.from_numpy(density_map).unsqueeze(0)
 
-    # 3. Execute Hard Physics Simulation
+    # 3. Spatial Alignment to UNet Topology
+    target_shape = (96, 96, 96)
+    resizer = Resize(spatial_size=target_shape, mode="trilinear")
+    mask_resizer = Resize(spatial_size=target_shape, mode="nearest")
+    
+    # Redimensionamos primero y LUEGO añadimos el Batch dimension (.unsqueeze(0))
+    img_resized = resizer(multi_channel_img).unsqueeze(0).to(device)
+    mask_resized = mask_resizer(mask_tensor).unsqueeze(0).to(device)
+    delta_t = torch.tensor([target_days], dtype=torch.float32).to(device)
+
+    logger.info("Executing Hard Physics Integration.", extra={"target_days": target_days})
+    
+    # 4. Predict D, rho and integrate PDE over time
     with torch.no_grad():
-        u_pred_tn, parametric_maps = model(img_resized, mask_resized, delta_t)
-        
-    # 4. Post-process and Restore original geometry
-    # We must upsample the prediction back to the patient's native resolution
+        u_pred_tn, parametric_maps = model.digital_twin(img_resized, mask_resized, delta_t)
+
+    # 5. Restore Original Geometry and Discretize
+    logger.info("Restoring original patient geometry and generating Slicer3D segments.")
     restore_resizer = Resize(spatial_size=original_shape, mode="trilinear")
-    u_pred_restored = restore_resizer(u_pred_tn.cpu()).squeeze().numpy()
     
+    u_pred_restored = restore_resizer(u_pred_tn.cpu()).squeeze().numpy()
     D_map_restored = restore_resizer(parametric_maps["diffusion_D"].cpu()).squeeze().numpy()
     rho_map_restored = restore_resizer(parametric_maps["proliferation_rho"].cpu()).squeeze().numpy()
 
-    # Apply clinical discretization
     clinical_segmentation = _discretize_to_clinical_classes(u_pred_restored)
 
-    # 5. Export NIfTI files for 3D Slicer
+    # 6. Export Results
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    
-    patient_id = Path(image_t0_path).name.split("_")[0]
     
     nib.save(nib.Nifti1Image(clinical_segmentation, original_affine), out_path / f"{patient_id}_simulated_day_{int(target_days)}_classes.nii.gz")
     nib.save(nib.Nifti1Image(u_pred_restored, original_affine), out_path / f"{patient_id}_simulated_day_{int(target_days)}_density.nii.gz")
     nib.save(nib.Nifti1Image(D_map_restored, original_affine), out_path / f"{patient_id}_param_D.nii.gz")
     nib.save(nib.Nifti1Image(rho_map_restored, original_affine), out_path / f"{patient_id}_param_rho.nii.gz")
 
-    logger.info("Simulation completed and exported successfully.", extra={"output_dir": str(out_path)})
+    logger.info("Simulation completed successfully.", extra={"output_dir": str(out_path)})
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simulate Glioblastoma Growth")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to the trained .ckpt file")
-    parser.add_argument("--image_t0", type=str, required=True, help="Path to T0 FLAIR MRI")
-    parser.add_argument("--mask_t0", type=str, required=True, help="Path to T0 Segmentation Mask")
+    parser.add_argument("--data_dir", type=str, default="data", help="Root directory containing 'images' and 'masks'")
+    parser.add_argument("--patient_id", type=str, required=True, help="Base ID of the patient (e.g., UPENN-GBM-00036_11)")
     parser.add_argument("--output_dir", type=str, default="simulations/output", help="Directory to save NIfTI results")
     parser.add_argument("--target_days", type=float, default=60.0, help="Days to simulate into the future")
     
     args = parser.parse_args()
-    run_simulation(args.checkpoint, args.image_t0, args.mask_t0, args.output_dir, args.target_days)
+    run_simulation(args.checkpoint, args.data_dir, args.patient_id, args.output_dir, args.target_days)
