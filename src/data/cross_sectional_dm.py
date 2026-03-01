@@ -139,6 +139,11 @@ class CrossSectionalDataModule(pl.LightningDataModule):
         if not raw_data:
             raise RuntimeError("No valid 4-channel MRI + Mask pairs found in directories.")
 
+        import sys
+        if "--fast_dev_run" in sys.argv:
+            logger.warning("FAST DEV RUN detected. Limiting cache to 8 patients for speed.")
+            raw_data = raw_data[:8]
+        
         logger.info("Auto-discovery complete.", extra={"valid_patients": len(raw_data)})
 
         np.random.seed(42)

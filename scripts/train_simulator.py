@@ -149,18 +149,32 @@ class SelfSupervisedGlioSim(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-5)
 
-def main(args):
+def main(args: argparse.Namespace) -> None:
     logger.info("Initializing Amortized Inference Pipeline...")
 
-    datamodule = CrossSectionalDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
-    model = SelfSupervisedGlioSim(lr=args.lr, simulation_horizon=args.simulation_horizon)
+    # If in fast_dev_run, we don't want WandB to log a fake 1-step experiment
+    logger_type = WandbLogger(project="GlioSim-Amortized-Twin", log_model="all") if not args.fast_dev_run else False
 
+    datamodule = CrossSectionalDataModule(
+        data_dir=args.data_dir, 
+        batch_size=args.batch_size
+    )
+    
+    model = SelfSupervisedGlioSim(
+        lr=args.lr, 
+        simulation_horizon=args.simulation_horizon
+    )
+
+    local_checkpoint_dir = "checkpoints"
+    
     checkpoint_callback = ModelCheckpoint(
-        dirpath=args.checkpoint_dir,
+        dirpath=local_checkpoint_dir,
         filename="amortized-twin-{epoch:02d}-{val_dice_global:.3f}",
         monitor="val/dice_global",
         mode="max",
         save_top_k=3,
+        save_last=True,
+        every_n_epochs=1
     )
     
     early_stop_callback = EarlyStopping(
@@ -170,9 +184,9 @@ def main(args):
         verbose=True
     )
 
-    wandb_logger = WandbLogger(project="GlioSim-Amortized-Twin", log_model="all")
     torch.set_float32_matmul_precision('high')
 
+    # Add the fast_dev_run flag to the Trainer
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="gpu",
@@ -180,21 +194,32 @@ def main(args):
         precision="bf16-mixed", 
         gradient_clip_val=1.0,
         benchmark=True,
-        logger=wandb_logger,
-        callbacks=[checkpoint_callback, early_stop_callback]
+        logger=logger_type,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        fast_dev_run=args.fast_dev_run
     )
 
-    logger.info("Igniting self-supervised simulation engine.")
-    trainer.fit(model, datamodule=datamodule)
+    mode = "DRY RUN (Smoke Test)" if args.fast_dev_run else "FULL TRAINING"
+    logger.info(f"Igniting self-supervised simulation engine. Mode: {mode}")
+    
+    try:
+        trainer.fit(model, datamodule=datamodule)
+    except Exception as e:
+        logger.error("Training pipeline encountered a critical failure.", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the Amortized Digital Twin")
-    parser.add_argument("--data_dir", type=str, default="data", help="Directory containing dataset_registry.csv")
+    
+    # Hiperparámetros de control total
+    parser.add_argument("--data_dir", type=str, default="data", help="Directory containing dataset")
     parser.add_argument("--epochs", type=int, default=150, help="Maximum training epochs")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--simulation_horizon", type=float, default=100.0, help="Fixed virtual days to grow the seed")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Save directory")
+    parser.add_argument("--simulation_horizon", type=float, default=50.0, help="Fixed virtual days")
+    
+    # Interruptor para el Dry-Run (Prueba rápida)
+    parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 batch of train and val to find bugs quickly")
     
     parsed_args = parser.parse_args()
     main(parsed_args)

@@ -1,101 +1,91 @@
 import logging
 import torch
 import torch.nn as nn
+from typing import Tuple, Dict
 
 # Configure structured logging
 logger = logging.getLogger(__name__)
 
 class MacroscopicDigitalTwin(nn.Module):
     """
-    End-to-End Hard-Physics Digital Twin for Glioblastoma Growth.
-    
-    Orchestrates the anatomical state extraction, enforces biological constraints,
-    and integrates the physical state forward in time using a differentiable PDE solver.
+    Couples the U-Net feature extractor with the hard-physics Euler solver.
+    Implements strict biomechanical scaling to prevent Vanishing/Exploding Gradients
+    during massive Backpropagation Through Time (BPTT) unrolling.
     """
-
-    def __init__(
-        self, 
-        extractor_module: nn.Module, 
-        physics_solver: nn.Module
-    ):
-        """
-        Initializes the Digital Twin via Dependency Injection.
-        
-        Args:
-            extractor_module (nn.Module): The U-Net to extract D and rho maps (BaselineStateExtractor).
-            physics_solver (nn.Module): The explicit time integrator (DifferentiableEulerSolver).
-        """
+    def __init__(self, extractor_module: nn.Module, physics_solver: nn.Module):
         super().__init__()
-        
-        if not isinstance(extractor_module, nn.Module) or not isinstance(physics_solver, nn.Module):
-            logger.error("Invalid modules provided for MacroscopicDigitalTwin initialization.")
-            raise TypeError("Both extractor_module and physics_solver must be nn.Module instances.")
-            
         self.extractor = extractor_module
-        self.solver = physics_solver
+        self.physics_solver = physics_solver
         
-        # Swanson's Biological Constraints (mm^2/day for D, 1/day for rho)
-        self.D_MIN = 0.001
-        self.D_MAX = 0.020
-        self.RHO_MIN = 0.012
-        self.RHO_MAX = 0.034
+        # Biological constraints (Swanson's Glioblastoma boundaries)
+        # These act as gradient amplifiers to ensure the tumor physically grows
+        # preventing the "cold start" vanishing gradient problem.
+        self.biological_D_max = 0.20    # Max diffusion (mm^2 / day)
+        self.biological_rho_max = 0.10  # Max proliferation (1 / day)
         
-        logger.info("MacroscopicDigitalTwin initialized with Hard-Physics architecture.")
-
-    def _apply_biological_constraints(self, raw_D: torch.Tensor, raw_rho: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Maps the bounded neural network outputs into strict, literature-backed 
-        physical units for glioblastoma dynamics.
-        """
-        # Assuming raw_D and raw_rho already passed through Softplus/Sigmoid in the Extractor
-        # We use a normalized scaling approach assuming the input is roughly [0, 1] bounded.
-        # If raw_D is from Softplus, we can apply a clamping or a learned scaling.
-        # For strict bounds, we apply a Sigmoid-like transformation here to guarantee limits.
-        
-        # Transform unbounded/softplus D into strictly bounded physical D
-        scaled_D = self.D_MIN + torch.sigmoid(raw_D) * (self.D_MAX - self.D_MIN)
-        
-        # Transform raw_rho (assuming Sigmoid from extractor) into physical rho
-        scaled_rho = self.RHO_MIN + raw_rho * (self.RHO_MAX - self.RHO_MIN)
-        
-        return scaled_D, scaled_rho
+        logger.info("MacroscopicDigitalTwin initialized with Biomechanical Scaling.",
+                    extra={
+                        "D_max": self.biological_D_max, 
+                        "rho_max": self.biological_rho_max
+                    })
 
     def forward(
         self, 
-        mri_t0: torch.Tensor, 
-        tumor_mask_t0: torch.Tensor, 
-        target_time_days: torch.Tensor
-    ) -> tuple[torch.Tensor, dict]:
+        image_t0: torch.Tensor, 
+        seed_mask: torch.Tensor, 
+        target_days: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Executes the complete macroscopic simulation pipeline.
+        Executes the AI deduction and physics integration pipeline.
+        """
+        if image_t0.shape[0] != seed_mask.shape[0] or image_t0.shape[0] != target_days.shape[0]:
+            logger.error("Batch dimension mismatch in Digital Twin forward pass.")
+            raise ValueError("Inconsistent batch sizes among inputs.")
+
+        # 1. AI Deduction: Extract raw logits from the U-Net
+        raw_parameters = self.extractor(image_t0)
         
-        Args:
-            mri_t0 (torch.Tensor): Structural MRI at Day 0. Shape: [B, C, D, H, W]
-            tumor_mask_t0 (torch.Tensor): Binary/Soft tumor segmentation at Day 0.
-            target_time_days (torch.Tensor): Temporal prediction horizon T_n per batch item.
+        # MONAI BasicUNet might return a tuple or a tensor depending on version/mode
+        if isinstance(raw_parameters, tuple):
+            raw_parameters = raw_parameters[0]
+                
+        # 2. Biomechanical Scaling (The Anti-Vanishing Gradient fix)
+        # Apply Sigmoid to bound outputs to (0, 1), then scale to physical realities.
+        # Adding a tiny epsilon (1e-4) ensures D and rho are NEVER exactly zero.
+        normalized_params = torch.sigmoid(raw_parameters)
+        
+        D_map = (normalized_params[:, 0:1, ...] * self.biological_D_max) + 1e-4
+        rho_map = (normalized_params[:, 1:2, ...] * self.biological_rho_max) + 1e-4
+
+        # Initialize the current state with the virtual origin seed
+        u_current = seed_mask.clone()
+        
+        # 3. Hard-Physics Integration
+        B = image_t0.shape[0]
+        u_simulated_batch = []
+        
+        for b in range(B):
+            # Slicing retains the batch dimension [1, C, D, H, W]
+            u_b = u_current[b:b+1]
+            D_b = D_map[b:b+1]
+            rho_b = rho_map[b:b+1]
             
-        Returns:
-            tuple:
-                - u_pred_tn (torch.Tensor): Predicted tumor density at T_n.
-                - parametric_maps (dict): Dictionary containing the physical maps for logging/Slicer3D.
-        """
-        # 1. Extract raw physical parameters from static anatomy
-        raw_D, raw_rho = self.extractor(mri_t0)
+            # Slicing retains the 1D Tensor format [1] required by the physics solver
+            days_b = target_days[b:b+1] 
+            
+            # The solver handles the substeps internally
+            u_simulated = self.physics_solver(u_b, D_b, rho_b, days_b)
+            
+            # Strictly enforce biological density limits [0.0, 1.0] to prevent Exploding Gradients
+            u_simulated = torch.clamp(u_simulated, min=0.0, max=1.0)
+            u_simulated_batch.append(u_simulated)
+            
+        u_final = torch.cat(u_simulated_batch, dim=0)
         
-        # 2. Map to biological units (Swanson's Constraints)
-        D_map, rho_map = self._apply_biological_constraints(raw_D, raw_rho)
-        
-        # 3. Integrate forward in time using the Differentiable PDE Solver
-        u_pred_tn = self.solver(
-            u_t0=tumor_mask_t0, 
-            D_map=D_map, 
-            rho_map=rho_map, 
-            delta_t_days=target_time_days
-        )
-        
+        # Return the final density and the deduced parameters for loss computation and logging
         parametric_maps = {
             "diffusion_D": D_map,
             "proliferation_rho": rho_map
         }
         
-        return u_pred_tn, parametric_maps
+        return u_final, parametric_maps
