@@ -132,17 +132,18 @@ def run_simulation(
     with torch.no_grad():
         u_pred_tn, parametric_maps = model.digital_twin(img_resized, mask_resized, delta_t)
 
-    # 5. Restore Original Geometry and Discretize
+    # 5. Restore Original Patient Geometry
     logger.info("Restoring original patient geometry and generating Slicer3D segments.")
     restore_resizer = Resize(spatial_size=original_shape, mode="trilinear")
     
-    u_pred_restored = restore_resizer(u_pred_tn.cpu()).squeeze().numpy()
-    D_map_restored = restore_resizer(parametric_maps["diffusion_D"].cpu()).squeeze().numpy()
-    rho_map_restored = restore_resizer(parametric_maps["proliferation_rho"].cpu()).squeeze().numpy()
+    # Squeeze(0) removes the Batch dimension so MONAI receives [C, D, H, W]
+    u_pred_restored = restore_resizer(u_pred_tn.cpu().squeeze(0)).squeeze().numpy()
+    D_map_restored = restore_resizer(parametric_maps["diffusion_D"].cpu().squeeze(0)).squeeze().numpy()
+    rho_map_restored = restore_resizer(parametric_maps["proliferation_rho"].cpu().squeeze(0)).squeeze().numpy()
 
     clinical_segmentation = _discretize_to_clinical_classes(u_pred_restored)
 
-    # 6. Export Results
+    # 6. Export Results to NIfTI
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     
