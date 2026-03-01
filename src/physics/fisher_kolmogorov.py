@@ -1,106 +1,115 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Configure structured logging
+logger = logging.getLogger(__name__)
 
-class FisherKolmogorovLoss(nn.Module):
+class FisherKolmogorovPDE(nn.Module):
     """
-    Physics-Informed Neural Network (PINN) loss function for Glioblastoma growth.
+    Computes the instantaneous rate of change (du/dt) for Glioblastoma growth
+    based on the Fisher-Kolmogorov reaction-diffusion equation.
     
-    Computes the residual of the Fisher-Kolmogorov reaction-diffusion PDE:
-    du/dt = div(D * grad(u)) + rho * u * (1 - u)
+    Equation: du/dt = div(D * grad(u)) + rho * u * (1 - u)
     
-    The network is penalized if this residual deviates from zero, enforcing
-    biological and physical plausibility in the spatiotemporal predictions.
+    Designed for Hard Physics differentiable solvers (Euler integration).
     """
 
     def __init__(self, voxel_spacing: float = 1.0):
         """
+        Initializes the PDE solver module.
+        
         Args:
-            voxel_spacing (float): The physical distance between voxels in mm.
-                                   Assumes isotropic spacing (1x1x1 mm) after ETL.
+            voxel_spacing (float): Isotropic voxel spacing in mm.
         """
         super().__init__()
+        
+        if voxel_spacing <= 0.0:
+            logger.error("Invalid voxel_spacing initialized.", extra={"voxel_spacing": voxel_spacing})
+            raise ValueError(f"voxel_spacing must be strictly positive, got {voxel_spacing}")
+            
         self.voxel_spacing = voxel_spacing
+        self.dx = voxel_spacing
         
-        # 3D Laplacian kernel using finite central differences (7-point stencil)
-        # Shape: [out_channels, in_channels, depth, height, width]
-        laplacian_kernel = torch.tensor([
-            [[0.0,  0.0, 0.0],
-             [0.0,  1.0, 0.0],
-             [0.0,  0.0, 0.0]],
+        # Central difference kernels for computing gradients along axes
+        # Shape: [out_channels, in_channels, D, H, W]
+        grad_x = torch.tensor([[[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+                               [[0., 0., 0.], [-0.5, 0., 0.5], [0., 0., 0.]],
+                               [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]]], dtype=torch.float32)
+                               
+        grad_y = torch.tensor([[[0., 0., 0.], [0., -0.5, 0.], [0., 0., 0.]],
+                               [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+                               [[0., 0., 0.], [0., 0.5, 0.], [0., 0., 0.]]], dtype=torch.float32)
+                               
+        grad_z = torch.tensor([[[-0.5, 0., 0.5]], [[0., 0., 0.]], [[0., 0., 0.]]], dtype=torch.float32).view(3, 3, 3)
+        # Fix z-axis kernel orientation
+        grad_z = torch.tensor([[[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+                               [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+                               [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]]], dtype=torch.float32)
+        grad_z[0, 1, 1] = -0.5
+        grad_z[2, 1, 1] = 0.5
 
-            [[0.0,  1.0, 0.0],
-             [1.0, -6.0, 1.0],
-             [0.0,  1.0, 0.0]],
-
-            [[0.0,  0.0, 0.0],
-             [0.0,  1.0, 0.0],
-             [0.0,  0.0, 0.0]]
-        ], dtype=torch.float32)
+        self.register_buffer("grad_x", grad_x.view(1, 1, 3, 3, 3))
+        self.register_buffer("grad_y", grad_y.view(1, 1, 3, 3, 3))
+        self.register_buffer("grad_z", grad_z.view(1, 1, 3, 3, 3))
         
-        # Reshape for F.conv3d (1, 1, 3, 3, 3)
-        self.register_buffer(
-            "laplacian_kernel", 
-            laplacian_kernel.view(1, 1, 3, 3, 3)
-        )
+        logger.info("FisherKolmogorovPDE initialized successfully.", 
+                    extra={"voxel_spacing": self.voxel_spacing})
+
+    def _compute_gradient(self, tensor: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the spatial gradient using central differences with Neumann boundary conditions.
+        """
+        # Replicate padding enforces zero-flux Neumann boundary conditions
+        padded_tensor = F.pad(tensor, (1, 1, 1, 1, 1, 1), mode='replicate')
+        return F.conv3d(padded_tensor, kernel) / self.dx
 
     def compute_spatial_diffusion(self, u: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
         """
-        Computes div(D * grad(u)) using a 3D Laplacian convolution.
-        
-        Args:
-            u (torch.Tensor): Tumor concentration [B, 1, D, H, W]
-            D (torch.Tensor): Diffusion coefficient map [B, 1, D, H, W]
-            
-        Returns:
-            torch.Tensor: The spatial diffusion term.
+        Computes div(D * grad(u)) correctly accounting for heterogeneous D.
         """
-        # Apply the Laplacian filter to calculate grad^2(u)
-        # Padding=1 ensures the output tensor shape matches the input
-        laplacian_u = F.conv3d(u, self.laplacian_kernel, padding=1)
+        # 1. Compute gradients of u
+        grad_u_x = self._compute_gradient(u, self.grad_x)
+        grad_u_y = self._compute_gradient(u, self.grad_y)
+        grad_u_z = self._compute_gradient(u, self.grad_z)
         
-        # Adjust for physical voxel spacing: dx^2
-        laplacian_u = laplacian_u / (self.voxel_spacing ** 2)
+        # 2. Multiply by D to get the flux
+        flux_x = D * grad_u_x
+        flux_y = D * grad_u_y
+        flux_z = D * grad_u_z
         
-        # div(D * grad(u)) ≈ D * Laplacian(u) assuming D varies slowly locally
-        diffusion_term = D * laplacian_u
+        # 3. Compute the divergence of the flux: div(F) = dx(Fx) + dy(Fy) + dz(Fz)
+        div_flux_x = self._compute_gradient(flux_x, self.grad_x)
+        div_flux_y = self._compute_gradient(flux_y, self.grad_y)
+        div_flux_z = self._compute_gradient(flux_z, self.grad_z)
         
-        return diffusion_term
+        return div_flux_x + div_flux_y + div_flux_z
 
-    def forward(
-        self, 
-        u: torch.Tensor, 
-        du_dt: torch.Tensor, 
-        D: torch.Tensor, 
-        rho: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, u: torch.Tensor, D: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
         """
-        Calculates the Mean Squared Error (MSE) of the PDE residual.
+        Computes the forward temporal derivative du/dt.
         
         Args:
-            u (torch.Tensor): Predicted tumor concentration (0 to 1). Shape: [B, 1, D, H, W]
-            du_dt (torch.Tensor): Predicted temporal derivative. Shape: [B, 1, D, H, W]
-            D (torch.Tensor): Predicted/Learned diffusion map. Shape: [B, 1, D, H, W]
-            rho (torch.Tensor): Predicted/Learned proliferation map. Shape: [B, 1, D, H, W]
+            u (torch.Tensor): Current tumor concentration. Shape: [B, 1, Depth, Height, Width]
+            D (torch.Tensor): Diffusion coefficient map. Shape: [B, 1, Depth, Height, Width]
+            rho (torch.Tensor): Proliferation rate map. Shape: [B, 1, Depth, Height, Width]
             
         Returns:
-            torch.Tensor: Scalar loss value.
+            torch.Tensor: The temporal derivative du/dt. Shape: [B, 1, Depth, Height, Width]
         """
-        # 1. Validate tensor shapes to prevent silent broadcasting bugs
-        assert u.shape == du_dt.shape == D.shape == rho.shape, \
-            f"Shape mismatch: u{u.shape}, du_dt{du_dt.shape}, D{D.shape}, rho{rho.shape}"
-            
-        # 2. Calculate the Spatial Diffusion Term
+        if not (u.shape == D.shape == rho.shape):
+            logger.error("Tensor shape mismatch during forward pass.", 
+                         extra={"u_shape": list(u.shape), "D_shape": list(D.shape), "rho_shape": list(rho.shape)})
+            raise ValueError(f"Shape mismatch: u{u.shape}, D{D.shape}, rho{rho.shape}")
+
+        # 1. Spatial Diffusion Term
         diffusion_term = self.compute_spatial_diffusion(u, D)
         
-        # 3. Calculate the Reaction/Proliferation Term: rho * u * (1 - u)
+        # 2. Reaction/Proliferation Term: rho * u * (1 - u)
         reaction_term = rho * u * (1.0 - u)
         
-        # 4. Compute the PDE Residual: du/dt - (Diffusion + Reaction) = 0
-        pde_residual = du_dt - (diffusion_term + reaction_term)
+        # 3. Compute du/dt
+        du_dt = diffusion_term + reaction_term
         
-        # 5. The loss is the Mean Squared Error of the residual (we want it to be 0)
-        loss_pde = torch.mean(pde_residual ** 2)
-        
-        return loss_pde
+        return du_dt

@@ -1,48 +1,83 @@
+import logging
 import torch
 import torch.nn as nn
-from monai.networks.nets import UNet
-import logging
+from monai.networks.nets import BasicUNet
 
-# Professional structured logging
-logger = logging.getLogger("BaselineStateExtractor")
+# Configure structured logging
+logger = logging.getLogger(__name__)
 
 class BaselineStateExtractor(nn.Module):
     """
-    Static anatomical feature extractor for Hard-Physics PINN.
-    Analyzes the T0 MRI to predict spatial maps for Diffusion (D) and Proliferation (rho).
-    Temporal dynamics are explicitly decoupled from this module.
+    Anatomical feature extractor for Hard-Physics PINN.
+    
+    Analyzes static multi-modal MRI inputs (e.g., T0, White Matter masks) 
+    to predict smooth, biologically plausible spatial maps for Diffusion (D) 
+    and Proliferation (rho).
     """
-    def __init__(self, in_channels: int = 1, out_channels: int = 2):
-        super().__init__()
-        logger.info(f"Initializing Static Extractor: in_channels={in_channels}, out_channels={out_channels}")
-        
-        # Standard 3D UNet architecture optimized for spatial feature extraction
-        self.unet = UNet(
-            spatial_dims=3,
-            in_channels=in_channels,
-            out_channels=out_channels, # Strictly 2 channels: D_map and rho_map
-            channels=(16, 32, 64, 128, 256),
-            strides=(2, 2, 2, 2),
-            num_res_units=2,
-            norm="batch"
-        )
 
-    def forward(self, x: torch.Tensor):
+    def __init__(self, in_channels: int = 1):
         """
-        Forward pass extracting physical parameters from static anatomy.
+        Initializes the state extractor with strict upsampling rules.
         
         Args:
-            x: Input MRI tensor [Batch, Channels, Depth, Height, Width]
+            in_channels (int): Number of input modalities. Defaults to 1 for just T0, 
+                               but should be increased if concatenating anatomical priors (WM/GM).
+        """
+        super().__init__()
+        
+        # We output exactly 2 channels: [D_map, rho_map]
+        out_channels = 2 
+        
+        logger.info(
+            "Initializing BaselineStateExtractor.", 
+            extra={"in_channels": in_channels, "out_channels": out_channels}
+        )
+        
+        # Using BasicUNet with upsample="nontrainable" forces Trilinear Interpolation
+        # instead of ConvTranspose3d, effectively eliminating checkerboard artifacts.
+        self.unet = BasicUNet(
+            spatial_dims=3,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            features=(16, 32, 64, 128, 256, 16), # Final feature map before output
+            upsample="nontrainable" # CRITICAL: Trilinear interpolation + Conv3d
+        )
+        
+        # Physics-constrained activations
+        # Softplus ensures Diffusion is strictly positive and avoids dead gradients from ReLU
+        self.diffusion_activation = nn.Softplus()
+        
+        # Sigmoid ensures Proliferation rate stays within [0, 1] bounds
+        self.proliferation_activation = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extracts bounded physical parameters from structural MRI.
+        
+        Args:
+            x (torch.Tensor): Input tensor. Shape: [B, C, Depth, Height, Width]
             
         Returns:
-            raw_D: Unscaled diffusion logits [B, 1, D, H, W]
-            raw_rho: Unscaled proliferation logits [B, 1, D, H, W]
+            tuple:
+                - D_map (torch.Tensor): Bounded diffusion map (> 0). Shape: [B, 1, D, H, W]
+                - rho_map (torch.Tensor): Bounded proliferation map (0 to 1). Shape: [B, 1, D, H, W]
         """
-        # Execute UNet without time concatenation
+        # 1. Forward pass through the artifact-free UNet
         output = self.unet(x)
         
-        # Split the 2 output channels into their respective physical variables
+        if output.shape[1] != 2:
+            logger.error(f"Expected 2 output channels, got {output.shape[1]}")
+            raise RuntimeError("UNet output channel mismatch.")
+            
+        # 2. Split feature maps
         raw_D = output[:, 0:1, ...]
         raw_rho = output[:, 1:2, ...]
         
-        return raw_D, raw_rho
+        # 3. Enforce physical bounds via activations
+        # D > 0 (prevents backward time diffusion)
+        D_map = self.diffusion_activation(raw_D)
+        
+        # 0 <= rho <= 1 (normalized biological growth rate)
+        rho_map = self.proliferation_activation(raw_rho)
+        
+        return D_map, rho_map

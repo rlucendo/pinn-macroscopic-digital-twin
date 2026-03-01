@@ -1,91 +1,101 @@
 import logging
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# Senior-level structured logging
-logger = logging.getLogger("PhysicsEngine_Precision")
+# Configure structured logging
+logger = logging.getLogger(__name__)
 
-class PINNSimulator(nn.Module):
+class MacroscopicDigitalTwin(nn.Module):
     """
-    High-Precision Physics-Informed Neural Network Simulator.
-    Implements Pure Sparse Collocation Autograd to maximize gradient purity
-    and prevent background tissue from diluting the PDE loss.
+    End-to-End Hard-Physics Digital Twin for Glioblastoma Growth.
+    
+    Orchestrates the anatomical state extraction, enforces biological constraints,
+    and integrates the physical state forward in time using a differentiable PDE solver.
     """
-    def __init__(self):
+
+    def __init__(
+        self, 
+        extractor_module: nn.Module, 
+        physics_solver: nn.Module
+    ):
+        """
+        Initializes the Digital Twin via Dependency Injection.
+        
+        Args:
+            extractor_module (nn.Module): The U-Net to extract D and rho maps (BaselineStateExtractor).
+            physics_solver (nn.Module): The explicit time integrator (DifferentiableEulerSolver).
+        """
         super().__init__()
-        self._register_laplacian_kernel()
-        logger.info("Precision PDE Solver initialized: Pure Sparse Autograd enabled.")
+        
+        if not isinstance(extractor_module, nn.Module) or not isinstance(physics_solver, nn.Module):
+            logger.error("Invalid modules provided for MacroscopicDigitalTwin initialization.")
+            raise TypeError("Both extractor_module and physics_solver must be nn.Module instances.")
+            
+        self.extractor = extractor_module
+        self.solver = physics_solver
+        
+        # Swanson's Biological Constraints (mm^2/day for D, 1/day for rho)
+        self.D_MIN = 0.001
+        self.D_MAX = 0.020
+        self.RHO_MIN = 0.012
+        self.RHO_MAX = 0.034
+        
+        logger.info("MacroscopicDigitalTwin initialized with Hard-Physics architecture.")
 
-    def _register_laplacian_kernel(self):
-        """Discrete 3D Laplacian operator for spatial diffusion."""
-        kernel = torch.zeros((1, 1, 3, 3, 3))
-        kernel[0, 0, 1, 1, 1] = -6.0
-        # Axial neighbors
-        kernel[0, 0, 0, 1, 1] = 1.0; kernel[0, 0, 2, 1, 1] = 1.0
-        kernel[0, 0, 1, 0, 1] = 1.0; kernel[0, 0, 1, 2, 1] = 1.0
-        kernel[0, 0, 1, 1, 0] = 1.0; kernel[0, 0, 1, 1, 2] = 1.0
-        self.register_buffer("laplacian", kernel)
-
-    def compute_sparse_residual(self, u_pred: torch.Tensor, t: torch.Tensor, d_map: torch.Tensor, rho_map: torch.Tensor, num_points: int = 20000) -> torch.Tensor:
+    def _apply_biological_constraints(self, raw_D: torch.Tensor, raw_rho: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Evaluates the Fisher-Kolmogorov PDE strictly on a strategic point cloud.
-        By isolating the Autograd graph to these points, we prevent gradient dilution.
+        Maps the bounded neural network outputs into strict, literature-backed 
+        physical units for glioblastoma dynamics.
         """
-        batch_size = u_pred.shape[0]
+        # Assuming raw_D and raw_rho already passed through Softplus/Sigmoid in the Extractor
+        # We use a normalized scaling approach assuming the input is roughly [0, 1] bounded.
+        # If raw_D is from Softplus, we can apply a clamping or a learned scaling.
+        # For strict bounds, we apply a Sigmoid-like transformation here to guarantee limits.
         
-        # 1. Spatial Derivative (Computed densely, as Conv3D is highly optimized)
-        laplacian_u = F.conv3d(u_pred, self.laplacian, padding=1)
-
-        # 2. Strategic Point Cloud Generation (Importance Sampling)
-        # We target regions with existing tumor density, minimizing empty space evaluation
-        with torch.no_grad():
-            weights = (u_pred.view(batch_size, -1) + 1e-4)
-            indices = torch.multinomial(weights, num_points, replacement=False)
-
-        # 3. Flatten and Gather
-        # Extract only the critical values needed for the physical formulas
-        u_flat = u_pred.view(batch_size, -1)
-        u_s = torch.gather(u_flat, 1, indices)
+        # Transform unbounded/softplus D into strictly bounded physical D
+        scaled_D = self.D_MIN + torch.sigmoid(raw_D) * (self.D_MAX - self.D_MIN)
         
-        lap_s = torch.gather(laplacian_u.view(batch_size, -1), 1, indices)
-        d_s = torch.gather(d_map.view(batch_size, -1), 1, indices)
-        rho_s = torch.gather(rho_map.view(batch_size, -1), 1, indices)
-
-        # 4. Pure Sparse Temporal Autograd
-        # The computation graph is built strictly for the 'num_points', yielding high-magnitude, accurate gradients.
-        dudt_s = torch.autograd.grad(
-            outputs=u_s,
-            inputs=t,
-            grad_outputs=torch.ones_like(u_s),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True
-        )[0]
-
-        # 5. Physics Assembly on Point Cloud
-        diffusion_term = d_s * lap_s
-        proliferation_term = rho_s * u_s * (1.0 - u_s)
+        # Transform raw_rho (assuming Sigmoid from extractor) into physical rho
+        scaled_rho = self.RHO_MIN + raw_rho * (self.RHO_MAX - self.RHO_MIN)
         
-        residual_sampled = dudt_s - diffusion_term - proliferation_term
-        return residual_sampled
+        return scaled_D, scaled_rho
 
-    def calculate_loss(self, u_pred_t, u_pred_t0, target_t0, t, raw_D, raw_rho):
+    def forward(
+        self, 
+        mri_t0: torch.Tensor, 
+        tumor_mask_t0: torch.Tensor, 
+        target_time_days: torch.Tensor
+    ) -> tuple[torch.Tensor, dict]:
         """
-        Standardized loss function prioritizing physical constraints on active tissue.
+        Executes the complete macroscopic simulation pipeline.
+        
+        Args:
+            mri_t0 (torch.Tensor): Structural MRI at Day 0. Shape: [B, C, D, H, W]
+            tumor_mask_t0 (torch.Tensor): Binary/Soft tumor segmentation at Day 0.
+            target_time_days (torch.Tensor): Temporal prediction horizon T_n per batch item.
+            
+        Returns:
+            tuple:
+                - u_pred_tn (torch.Tensor): Predicted tumor density at T_n.
+                - parametric_maps (dict): Dictionary containing the physical maps for logging/Slicer3D.
         """
-        # Map neural outputs to Swanson's biological constraints
-        D_map = 0.001 + torch.sigmoid(raw_D) * (0.020 - 0.001)
-        rho_map = 0.012 + torch.sigmoid(raw_rho) * (0.034 - 0.012)
-
-        # Term 1: Initial Condition Loss (Evaluated densely to preserve global anatomy)
-        loss_ic = F.mse_loss(u_pred_t0, target_t0)
+        # 1. Extract raw physical parameters from static anatomy
+        raw_D, raw_rho = self.extractor(mri_t0)
         
-        # Term 2: Physics Loss (Evaluated sparsely to maximize gradient accuracy)
-        residual_sampled = self.compute_sparse_residual(u_pred_t, t, D_map, rho_map, num_points=20000)
-        loss_physics = torch.mean(residual_sampled**2)
+        # 2. Map to biological units (Swanson's Constraints)
+        D_map, rho_map = self._apply_biological_constraints(raw_D, raw_rho)
         
-        # Weighting ratio proven to yield < 0.1 loss in prior empirical testing
-        total_loss = (10.0 * loss_ic) + (1.0 * loss_physics)
+        # 3. Integrate forward in time using the Differentiable PDE Solver
+        u_pred_tn = self.solver(
+            u_t0=tumor_mask_t0, 
+            D_map=D_map, 
+            rho_map=rho_map, 
+            delta_t_days=target_time_days
+        )
         
-        return total_loss, loss_ic, loss_physics
+        parametric_maps = {
+            "diffusion_D": D_map,
+            "proliferation_rho": rho_map
+        }
+        
+        return u_pred_tn, parametric_maps
