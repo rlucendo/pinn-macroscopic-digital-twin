@@ -186,6 +186,15 @@ def main(args: argparse.Namespace) -> None:
 
     torch.set_float32_matmul_precision('high')
 
+    # --- PYTORCH 2.6+ SECURITY PATCH ---
+    import monai
+    try:
+        torch.serialization.add_safe_globals([monai.utils.enums.TraceKeys])
+        logger.info("Security patch applied: MONAI TraceKeys added to safe globals.")
+    except AttributeError:
+        pass # Fallback for older PyTorch versions
+    # -----------------------------------
+
     # Add the fast_dev_run flag to the Trainer
     trainer = pl.Trainer(
         max_epochs=args.epochs,
@@ -203,7 +212,13 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"Igniting self-supervised simulation engine. Mode: {mode}")
     
     try:
-        trainer.fit(model, datamodule=datamodule)
+        # Inject the checkpoint path into the Trainer to restore model weights, 
+        # optimizer momentum, and epoch counters for seamless resumption.
+        trainer.fit(
+            model, 
+            datamodule=datamodule, 
+            ckpt_path=args.resume_from_checkpoint
+        )
     except Exception as e:
         logger.error("Training pipeline encountered a critical failure.", exc_info=True)
         raise
@@ -211,15 +226,15 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the Amortized Digital Twin")
     
-    # Hiperparámetros de control total
     parser.add_argument("--data_dir", type=str, default="data", help="Directory containing dataset")
     parser.add_argument("--epochs", type=int, default=150, help="Maximum training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--simulation_horizon", type=float, default=50.0, help="Fixed virtual days")
-    
-    # Interruptor para el Dry-Run (Prueba rápida)
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 batch of train and val to find bugs quickly")
+    
+    # Checkpoint resumption path
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Absolute path to a valid .ckpt file to resume training")
     
     parsed_args = parser.parse_args()
     main(parsed_args)
