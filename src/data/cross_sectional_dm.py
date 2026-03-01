@@ -1,6 +1,6 @@
+import re
 import logging
 import torch
-import pandas as pd
 import numpy as np
 import nibabel as nib
 from pathlib import Path
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class CrossSectionalDataset(Dataset):
     """
-    Multimodal Dataset loading FLAIR, T1, T1GD, and T2.
+    Multimodal Dataset loading FLAIR, T1, T1CE/T1GD, and T2.
     Translates multi-class clinical segmentations into biological density maps (u).
     """
     def __init__(self, data_list: List[Dict[str, Any]], target_shape=(96, 96, 96)):
@@ -61,8 +61,6 @@ class CrossSectionalDataset(Dataset):
                 raw_mask = mask_nifti.get_fdata()
                 
                 # Biomechanical Mapping: Classes to Cell Density (u)
-                # Note: BraTS/UPENN standard: 1=Necrosis, 2=Edema, 4=Enhancing Core
-                # Adjust these numbers if UPENN-GBM uses a different standard (e.g., 1, 2, 3)
                 density_map = np.zeros_like(raw_mask, dtype=np.float32)
                 
                 # Dense tumor tissue (Core & Necrosis) mapped to max density 1.0
@@ -94,44 +92,54 @@ class CrossSectionalDataset(Dataset):
 
 
 class CrossSectionalDataModule(pl.LightningDataModule):
+    """
+    Dynamic DataModule that auto-discovers pairs from flat directories.
+    Requires ZERO CSV files.
+    """
     def __init__(self, data_dir: str = "data", batch_size: int = 4):
         super().__init__()
         self.save_hyperparameters()
 
     def setup(self, stage: Optional[str] = None):
-        csv_path = Path(self.hparams.data_dir) / "dataset_registry.csv"
-        # Since we use all available, we can also just scan the directory if CSV is outdated,
-        # but using the CSV is safer for metadata linking.
-        df = pd.read_csv(csv_path)
-        raw_data = []
         data_root = Path(self.hparams.data_dir)
+        images_dir = data_root / "images"
+        masks_dir = data_root / "masks"
+        
+        if not images_dir.exists() or not masks_dir.exists():
+            raise FileNotFoundError(f"Missing required directories: {images_dir} and/or {masks_dir}")
 
-        modality_suffixes = ["FLAIR", "T1", "T1GD", "T2"]
+        raw_data = []
+        # Note: If your contrast file is named T1CE instead of T1GD, change it here
+        modality_suffixes = ["FLAIR", "T1", "T1GD", "T2"] 
+        
+        # Regex to robustly extract UPENN patient ID (e.g., UPENN-GBM-00001_11)
+        # regardless of what prefix/suffix the mask file has.
+        id_pattern = re.compile(r"UPENN-GBM-\d+_\d+")
 
-        for _, row in df.iterrows():
-            p_id = str(row["patient_id"]).strip()
-            t0_id = f"{p_id}_11"
+        for mask_path in masks_dir.glob("*.nii.gz"):
+            match = id_pattern.search(mask_path.name)
+            if not match:
+                continue
+                
+            patient_id = match.group(0)
             
-            # Construct paths for all 4 modalities
-            img_dir = data_root / "images_structural" / t0_id
-            mod_paths = [img_dir / f"{t0_id}_{mod}.nii.gz" for mod in modality_suffixes]
+            # Construct expected paths for the 4 modalities
+            mod_paths = [images_dir / f"{patient_id}_{mod}.nii.gz" for mod in modality_suffixes]
             
-            # Use the automatic segmentation provided by the dataset
-            # Adjust the suffix '_segm.nii.gz' if the dataset uses a different naming convention
-            mask_path = data_root / "masks_t0" / f"{t0_id}_automatic_segm.nii.gz"
-
-            # Check if all 4 images and the mask exist
-            all_images_exist = all(p.exists() for p in mod_paths)
-            
-            if all_images_exist and mask_path.exists():
+            # Strict validation: Only append if all 4 structural scans exist
+            if all(p.exists() for p in mod_paths):
                 raw_data.append({
-                    "patient_id": p_id,
+                    "patient_id": patient_id,
                     "image_paths": [str(p) for p in mod_paths],
                     "mask_path": str(mask_path)
                 })
+            else:
+                logger.warning(f"Patient {patient_id} is missing modalities. Skipping.")
 
         if not raw_data:
-            raise RuntimeError("No valid multimodal pairs found.")
+            raise RuntimeError("No valid 4-channel MRI + Mask pairs found in directories.")
+
+        logger.info("Auto-discovery complete.", extra={"valid_patients": len(raw_data)})
 
         np.random.seed(42)
         np.random.shuffle(raw_data)
